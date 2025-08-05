@@ -5,7 +5,7 @@ class PositionEncoding(nn.Module):
     def __init__(self,d_length=10,max_length_of_sentence=10):
         super().__init__()
 
-        pe=np.zeros( d_length , max_length_of_sentence)
+        pe = torch.zeros(max_length_of_sentence, d_length)
 
         position= torch.arange(start=0,end=max_length_of_sentence,step=1).float().unsqueeze(1)
         #[[0.],[1.],[2.],[3.]]
@@ -19,7 +19,8 @@ class PositionEncoding(nn.Module):
         self.register_buffer("pe",pe)
 
     def forward(self, word_embeddings):
-        return word_embeddings + self.pe[:word_embeddings.size(0),:]
+        return word_embeddings + self.pe[:word_embeddings.size(1), :].unsqueeze(0).to(word_embeddings.device)
+
 
 
 
