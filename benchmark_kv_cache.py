@@ -31,6 +31,20 @@ def benchmark_generation(seq_len_gen: int = 128, prompt_len: int = 32):
 
     prompt = torch.randint(0, vocab_size, (1, prompt_len), device=device)
 
+    # Warm-up: exercise both code paths once so CUDA context creation, kernel selection
+    # and allocator growth are not charged to whichever mode is timed first.
+    with torch.no_grad():
+        warm = prompt.clone()
+        for _ in range(8):
+            warm_logits, _ = model(warm)
+            warm = torch.cat([warm, torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)], dim=1)
+        warm_logits, warm_cache = model(prompt)
+        warm_next = torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)
+        for step in range(1, 8):
+            warm_logits, warm_cache = model(warm_next, start_pos=prompt_len + step - 1, kv_caches=warm_cache)
+            warm_next = torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)
+    torch.cuda.synchronize()
+
     # 1. Benchmark Full-Context Recomputation O(N^2)
     torch.cuda.synchronize()
     curr_tokens = prompt.clone()
@@ -47,7 +61,7 @@ def benchmark_generation(seq_len_gen: int = 128, prompt_len: int = 32):
     tok_per_sec_full = seq_len_gen / time_full_sec
     ms_per_tok_full = (time_full_sec / seq_len_gen) * 1000.0
 
-    # 2. Benchmark KV-Cache Generation O(1) step
+    # 2. Benchmark KV-Cache generation (one new token per step)
     torch.cuda.synchronize()
     curr_tokens_kv = prompt.clone()
     t0 = time.perf_counter()

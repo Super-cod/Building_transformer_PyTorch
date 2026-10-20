@@ -1,6 +1,11 @@
 # Modern Transformer Decoder Architecture & KV-Cache Inference Engine (`Building_transformer_PyTorch`)
 
-An implementation of the autoregressive Transformer Decoder architecture in modern PyTorch, designed for architectural correctness, shape contract validation, and high-throughput GPU inference with stateful KV-caching. Tested and benchmarked on physical NVIDIA GPU silicon (**GeForce RTX 3050 Laptop GPU**).
+A decoder-only (GPT-style) Transformer in PyTorch, built as a learning project. It has two parts:
+
+- **`transformer_core.py` (2026):** a pre-LayerNorm decoder with causal multi-head attention, sinusoidal positional encoding, a weight-tied LM head and an optional **KV-cache** for incremental decoding, plus tests and a decoding benchmark.
+- **`Decoder.py`, `train.py`, `attention.py`, ... (Aug 2025):** my earlier word-level model trained with PyTorch Lightning on the DailyDialog text (`train.py`). It is simpler than the core model (single attention head) and is kept as the original learning exercise.
+
+The architecture follows the standard Transformer decoder; it is not a novel design.
 
 ---
 
@@ -57,52 +62,49 @@ where:
 $$PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i / d_{\text{model}}}}\right)$$
 $$PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i / d_{\text{model}}}}\right)$$
 
-### 3. Stateful Key-Value (KV) Caching for $O(1)$ Autoregressive Steps
-In standard autoregressive generation without caching, generating token $t$ requires computing attention over all tokens $1 \dots t$, resulting in **$O(N^2)$ quadratic computational complexity**:
-$$\text{FLOPs}_{\text{no-cache}} = \sum_{t=1}^N 2 \cdot t \cdot d_{\text{model}} = O(N^2 \cdot d_{\text{model}})$$
-
-With **KV-caching**, past Key and Value representations are preserved in GPU memory:
-$$K_{\text{new}} = [K_{\text{cached}} \,\|\, k_{\text{current}}], \quad V_{\text{new}} = [V_{\text{cached}} \,\|\, v_{\text{current}}]$$
-The query $Q$ is computed only for the newly arriving single token ($1 \times d_k$). The attention step executes in **$O(1)$ constant time**, reducing overall sequence generation complexity to **$O(N)$ linear time**.
+### 3. Key-Value (KV) caching
+Without a cache, generating each new token re-runs the whole model over all `t` tokens produced so far, so total work over `N` generated tokens grows as O(N^2) in tokens processed. With a cache, the Key and Value tensors of earlier tokens are stored and only the newest token is pushed through the network:
+$$K_{	ext{new}} = [K_{	ext{cached}} \,\|\, k_{	ext{current}}], \quad V_{	ext{new}} = [V_{	ext{cached}} \,\|\, v_{	ext{current}}]$$
+The projections and feed-forward work per step become constant, so those costs grow linearly with `N`. The attention step itself still reads all `t` cached keys, so its cost per step grows with `t`. The cache trades memory for compute: it stores `2 x layers x t x d_model` values per sequence.
 
 ---
 
-## Empirical Benchmark Results (NVIDIA RTX 3050 GPU)
+## KV-cache benchmark (RTX 3050 Laptop GPU)
 
-Benchmarked on `6 layers, d_model=512, n_heads=8, d_ff=2048` generating 64 tokens from a 32-token prompt:
+`benchmark_kv_cache.py` generates 64 tokens (greedy decoding) from a 32-token prompt with a randomly initialised model (6 layers, `d_model=512`, 8 heads, `d_ff=2048`, vocabulary 4096, batch size 1, FP32). Both modes get a warm-up pass first, then one timed run each. Results from 5 runs:
 
-| Inference Mode | Total Time | Latency per Token | Generation Throughput | Complexity |
-| :--- | :---: | :---: | :---: | :---: |
-| **Full-Context Recomputation** | **0.512 s** | **8.00 ms/token** | **125.0 tokens/sec** | $O(N^2)$ Quadratic |
-| **Stateful KV-Cache Decoding** | **0.327 s** | **5.10 ms/token** | **196.0 tokens/sec** | $O(N)$ Linear |
+| Mode | Throughput | Latency per token |
+| :--- | :---: | :---: |
+| Full-context recomputation | 168-198 tokens/s | 5.1-5.9 ms |
+| KV-cache decoding | 220-235 tokens/s | 4.3-4.6 ms |
 
-* **Empirical Speedup:** **1.57x throughput increase** on the RTX 3050 GPU.
+**Speedup: 1.14x-1.30x.** The gain is modest at this size: with a batch of one and short sequences the loop is dominated by per-step kernel-launch and Python overhead rather than arithmetic, so the cache helps more as sequences get longer. An earlier version of this benchmark had no warm-up and showed a larger speedup (up to about 2x) because one-off CUDA start-up cost landed in whichever mode ran first; the warm-up pass removes that bias. The timings use random weights, so they say nothing about output quality.
 
 ---
 
 ## Automated Verification Suite
 
-Run the full verification and inference benchmark suite via PowerShell:
+From the repository root (needs `torch`; the benchmark uses a CUDA GPU if available):
 
-```powershell
-Set-Location "C:\Users\swaya\Desktop\TIMEPASS\claude\git\Building_transformer_PyTorch"
-.\run_tests.ps1
-```
-
-Or execute unit tests independently:
-
-```powershell
+```bash
 python tests/test_transformer_architecture.py
 python benchmark_kv_cache.py
 ```
 
-### Verified Properties
-* `[PASS]` Positional encoding sinusoidal mathematics (exact alternating $\sin, \cos$ frequencies).
-* `[PASS]` Tensor shape contracts verified across all internal layers and heads.
-* `[PASS]` Causal mask invariance: past hidden states are mathematically invariant ($\Delta = 0.000$) to future token perturbations.
-* `[PASS]` KV-Cache numerical equivalence: token-by-token generation with KV-cache produces the exact same logit distribution as full-sequence evaluation (numerical difference $< 4.77 \times 10^{-6}$).
+or run both with `.un_tests.ps1` in PowerShell. The legacy training scripts additionally need `lightning`, `transformers` and the bundled text datasets.
+
+### What the tests check
+- Positional encoding values match the sinusoidal formula.
+- Output shape is `(batch, seq, vocab)` through all layers.
+- Causal masking: changing future tokens leaves earlier logits unchanged (difference 0).
+- KV-cache equivalence: token-by-token decoding with the cache matches full-sequence logits (max difference below 1e-5 in my runs, test tolerance 1e-4).
 
 ---
+
+## Limitations
+- The benchmark measures speed on random weights; no model in `transformer_core.py` is trained.
+- The legacy Lightning model is word-level and small; its saved checkpoints are not evaluated here.
+- Single GPU, FP32, batch size 1; no multi-query/grouped attention, no FlashAttention, no batching of the cache.
 
 ## License
 
