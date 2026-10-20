@@ -1,0 +1,16 @@
+# PyTorch & Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Large model checkpoints (kept locally, omitted from commit diffs)
+*.pth
+*.pt
+*.bin
+lightning_logs/
+
+# Data files
+DailyDialog.txt
+vocab.pkl
